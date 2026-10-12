@@ -57,7 +57,7 @@ class FinalXMLWriter:
 
         return ET.tostring(
             root,
-            encoding='utf-8',
+            encoding='cp1251',
             xml_declaration=True,
             short_empty_elements=True
         )

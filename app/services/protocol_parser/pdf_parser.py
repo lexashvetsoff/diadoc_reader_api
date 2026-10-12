@@ -203,7 +203,7 @@ class PDFProtocolParser:
 
     def _detect_regulatory_schema(self, rows):
         """Сопоставление бизнес-поля с физическими столбцами таблицы на основе семантических ячеек заголовка."""
-        for row in rows[:6]:
+        for row in rows[:12]:
             normalized = [normalize_header(c) if c else "" for c in row]
             squashed = [x.replace(" ", "") for x in normalized]
 
@@ -251,6 +251,12 @@ class PDFProtocolParser:
                 }
         return None
 
+    @staticmethod
+    def _cell(row, index):
+        if index is None or index < 0 or index >= len(row):
+            return None
+        return clean_text(row[index])
+
     def _looks_like_physical_product(
         self, name, series, manufacturer, regulated, actual, sale_date
     ):
@@ -263,15 +269,18 @@ class PDFProtocolParser:
             and (decimal_or_none(regulated) is not None or decimal_or_none(actual) is not None)
         )
 
-    @staticmethod
-    def _cell(row, index):
-        if index is None or index < 0 or index >= len(row):
-            return None
-        return clean_text(row[index])
-
     # ------------------------------------------------------------------
     # Logical numbered-column geometry
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _legend_token(text: str) -> int | None:
+        text = (text or "").strip()
+        m = re.fullmatch(r"<?(\d{1,2})>?", text)
+        if not m:
+            return None
+        n = int(m.group(1))
+        return n if 1 <= n <= 22 else None
 
     def _legend_centers(self, words) -> dict[int, float] | None:
         """Find the horizontal legend containing logical column numbers."""
@@ -296,47 +305,6 @@ class PDFProtocolParser:
                 best = (score, mapping)
 
         return best[1] if best else None
-
-    def _logical_values(self, words, y0, y1, centers, boundaries):
-        buckets: dict[int, list] = {n: [] for n in centers}
-        for w in words:
-            cy = (w[1] + w[3]) / 2
-            if not (y0 - 0.8 <= cy <= y1 + 0.8):
-                continue
-            cx = (w[0] + w[2]) / 2
-            for logical, (left, right) in boundaries.items():
-                if left <= cx < right:
-                    buckets[logical].append(w)
-                    break
-
-        return {
-            n: self._join_words(ws) if ws else None
-            for n, ws in buckets.items()
-        }
-
-    def _looks_like_regulatory_product(self, values):
-        name = values.get(2)
-        series = values.get(3)
-        manufacturer = values.get(4)
-        regulated = decimal_or_none(values.get(5))
-        actual = decimal_or_none(values.get(6))
-        date_value = self._date_from_text(values.get(8))
-        return bool(
-            name and re.search(r"[A-Za-zА-Яа-яЁё]", name)
-            and series and re.search(r"[A-Za-zА-Яа-яЁё0-9]", series)
-            and manufacturer and re.search(r"[A-Za-zА-Яа-яЁё]", manufacturer)
-            and (regulated is not None or actual is not None)
-            and date_value is not None
-        )
-
-    @staticmethod
-    def _legend_token(text: str) -> int | None:
-        text = (text or "").strip()
-        m = re.fullmatch(r"<?(\d{1,2})>?", text)
-        if not m:
-            return None
-        n = int(m.group(1))
-        return n if 1 <= n <= 22 else None
 
     @staticmethod
     def _column_boundaries(centers: dict[int, float], page_width: float):
@@ -365,6 +333,23 @@ class PDFProtocolParser:
         # Предпочтительнее повторяющийся интервал
         interval = max(counts, key=lambda p: (counts[p], -(p[1] - p[0])))
         return interval
+
+    def _logical_values(self, words, y0, y1, centers, boundaries):
+        buckets: dict[int, list] = {n: [] for n in centers}
+        for w in words:
+            cy = (w[1] + w[3]) / 2
+            if not (y0 - 0.8 <= cy <= y1 + 0.8):
+                continue
+            cx = (w[0] + w[2]) / 2
+            for logical, (left, right) in boundaries.items():
+                if left <= cx < right:
+                    buckets[logical].append(w)
+                    break
+
+        return {
+            n: self._join_words(ws) if ws else None
+            for n, ws in buckets.items()
+        }
 
     @staticmethod
     def _join_words(words):
@@ -406,9 +391,37 @@ class PDFProtocolParser:
                     return int(w[4])
         return None
 
+    def _looks_like_regulatory_product(self, values):
+        name = values.get(2)
+        series = values.get(3)
+        manufacturer = values.get(4)
+        regulated = decimal_or_none(values.get(5))
+        actual = decimal_or_none(values.get(6))
+        date_value = self._date_from_text(values.get(8))
+        return bool(
+            name and re.search(r"[A-Za-zА-Яа-яЁё]", name)
+            and series and re.search(r"[A-Za-zА-Яа-яЁё0-9]", series)
+            and manufacturer and re.search(r"[A-Za-zА-Яа-яЁё]", manufacturer)
+            and (regulated is not None or actual is not None)
+            and date_value is not None
+        )
+
     # ------------------------------------------------------------------
     # Compact legacy form
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_compact_table(rows, col_count):
+        if col_count != 15:
+            return False
+        sample = normalize_header(" ".join(
+            clean_text(c) or "" for row in rows[:3] for c in row
+        ))
+        return (
+            "наименование товара" in sample
+            and "количество" in sample
+            and "отпускн цена поставщика" in sample
+        )
 
     def _parse_compact(self, rows, synthetic_line):
         result = []
@@ -435,19 +448,6 @@ class PDFProtocolParser:
             ))
             synthetic_line = max(synthetic_line, int(num))
         return result, synthetic_line
-
-    @staticmethod
-    def _is_compact_table(rows, col_count):
-        if col_count != 15:
-            return False
-        sample = normalize_header(" ".join(
-            clean_text(c) or "" for row in rows[:3] for c in row
-        ))
-        return (
-            "наименование товара" in sample
-            and "количество" in sample
-            and "отпускн цена поставщика" in sample
-        )
 
     # ------------------------------------------------------------------
     # Normalization
@@ -499,6 +499,14 @@ class PDFProtocolParser:
         value = cls._clean_pdf_text(value)
         if not value:
             return None
+
+        # Некоторые печатают срок действия в одной и той же ячейке физического ряда
+        value = re.sub(
+            r"(?i)\s+до\s+\d{2}\.\d{2}\.(?:\d{2}|\d{4})\s*$",
+            "",
+            value,
+        )
+
         # Серии обычно разделяются с помощью переноса строк в формате PDF: "GM82A06 26".
         # if re.fullmatch(r"[A-Za-zА-Яа-яЁё0-9]+(?:\s+[A-Za-zА-Яа-яЁё0-9]+)+", value):
         #     return value.replace(" ", "")

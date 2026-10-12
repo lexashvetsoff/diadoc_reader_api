@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from typing import Iterable
 from decimal import Decimal, InvalidOperation
@@ -93,7 +94,7 @@ class XMLRegistryParser:
             line_number=self._int(row.get('ПорНомер')),
             name=self._clean(row.get('Название')),
             product_code=product_code,
-            series=self._clean(row.get('Серия')),
+            series=self._clean_series(row.get('Серия')),
             manufacturer=manufacturer,
             quantity=self._decimal(row.get('Кол_во')),
             expiration_date=self._clean(row.get('Срок'))
@@ -152,6 +153,28 @@ class XMLRegistryParser:
             if name:
                 result[name.casefold()] = (child.get('Значение') or '').strip()
         return result
+
+    @classmethod
+    def _clean_series(cls, value) -> str | None:
+        """
+        Нормализация серии.
+
+        Пример:
+            "NAE91601\nМДЛП" -> "NAE91601"
+            "NAC74901\nМДЛП" -> "NAC74901"
+        """
+        value = cls._clean(value)
+        if not value:
+            return None
+
+        value = re.sub(
+            r"(?:\s+|[,;/]+\s*)МДЛП\s*$",
+            "",
+            value,
+            flags=re.IGNORECASE,
+        ).strip(" ,;/")
+
+        return value or None
 
     @staticmethod
     def _clean(value) -> str | None:

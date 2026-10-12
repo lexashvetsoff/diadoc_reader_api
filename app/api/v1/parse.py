@@ -11,7 +11,8 @@ from app.services.unified_parser.parser import DeliveryDocumentAssembler
 router = APIRouter()
 
 
-@router.post('/parce', response_model=ResponseData)
+# @router.post('/parse', response_model=ResponseData)
+@router.post('/parse')
 async def parse_pdf_endpoint(
     data: RequestData
 ):
@@ -23,10 +24,11 @@ async def parse_pdf_endpoint(
     try:
         result = parser.build_xml(upd=data.upd_file, registry=data.registry_file, protocol=data.protocol_file)
 
-        return ResponseData(
-            status='Ok',
-            content=result
-        )
+        # return ResponseData(
+        #     status='Ok',
+        #     content=result
+        # )
+        return PlainTextResponse(content=result, media_type="application/xml; charset=windows-1251")
     except Exception as e:
         return ResponseData(
             status='Error',

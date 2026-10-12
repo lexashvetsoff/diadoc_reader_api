@@ -140,6 +140,70 @@ def same_product_identity(a: str | None, b: str | None) -> bool:
     return bool(aa and bb and aa == bb)
 
 
+_CONTINUATION_HEADS = {
+    "мл",
+    "мг",
+    "г",
+    "шт",
+    "таблетки",
+    "таблетка",
+    "капсулы",
+    "капсула",
+    "порошок",
+    "аэрозоль",
+    "спрей",
+    "гель",
+    "крем",
+    "мазь",
+    "капли",
+    "сироп",
+    "лиофилизат",
+    "покрытые",
+    "покрытый",
+    "оболочкой",
+    "суспензии",
+    "суспензия",
+    "раствора",
+    "раствор",
+    "приема",
+    "внутрь",
+    "флакон",
+    "блистер",
+    "пачка",
+    "картонная",
+    "дозированный",
+}
+
+
+def looks_like_continuation_fragment(value: str | None) -> bool:
+    """
+    Обнаружение названия продукта протокола, которое явно начинается в середине строки.
+
+    Это происходит, когда строка физической таблицы PDF разделена разрывом страницы:
+        первая страница содержит начало торгового названия без серий/цен,
+        в то время как следующая страница содержит конец названия плюс серии/цены.
+    """
+    normalized = normalize_name(value)
+    if not normalized:
+        return False
+
+    tokens = re.findall(r"[0-9a-zа-я]+", normalized)
+    if not tokens:
+        return False
+
+    head = tokens[0]
+
+    # Typical mid-sentence starts observed in multi-page protocol rows.
+    if head in _CONTINUATION_HEADS:
+        return True
+
+    # A fragment may start with a dosage/unit or packaging continuation.
+    if re.fullmatch(r"\d+(?:[.,]\d+)?", head):
+        return True
+
+    return False
+
+
 def name_similarity(a: str | None, b: str | None) -> float:
     aa, bb = normalize_name(a), normalize_name(b)
     if not aa or not bb:
@@ -224,11 +288,21 @@ class ProductMatcher:
                     getattr(candidate_product, "name", None),
                 )
 
+            continuation_ok = (
+                looks_like_continuation_fragment(
+                    getattr(candidate_product, "name", None)
+                )
+                and candidate.name_similarity >= 0.80
+            )
+
             if (
                 candidate.exact_identifier
                 or identity_ok
                 or candidate.name_similarity >= 0.985
+                or continuation_ok
             ):
+                if continuation_ok and "pdf_continuation_fragment" not in candidate.evidence:
+                    candidate.evidence.append("pdf_continuation_fragment")
                 return "matched", candidate, ranked[:3]
 
             # Продолжает искать нормальное имя/идентификатор вместо 

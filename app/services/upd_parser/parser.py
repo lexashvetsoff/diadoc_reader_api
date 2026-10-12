@@ -63,7 +63,11 @@ class UPDParser:
             vat_rate=node.get('НалСт'),
             vat_amount=self._decimal(vat_text),
             amount_with_vat=self._decimal(node.get('СтТовУчНал')),
-            series=info_fields.get('НОМЕРСЕРИИ') or parsed_name.series,
+            series=(
+                info_fields.get('НОМЕРСЕРИИ')
+                or info_fields.get('СЕРИЯ')
+                or parsed_name.series
+            ),
             expiration_date=self._expiration(
                 info_fields.get('СРОКГОДНОСТИ'),
                 parsed_name.expiration_date,

@@ -194,6 +194,34 @@ class GridTableParser:
                 unique[p.line_number] = p
         return [unique[k] for k in sorted(unique)]
 
+    @staticmethod
+    def _map_physical_row(extracted_row, table_row, ranges):
+        """Map extracted cell text to semantic fields by physical X overlap."""
+        result = {}
+        cells = table_row.cells
+        for key, (sx0, sx1) in ranges.items():
+            semantic_width = max(1e-6, sx1 - sx0)
+            best = None
+            for idx, cell in enumerate(cells):
+                if cell is None or idx >= len(extracted_row):
+                    continue
+                x0, y0, x1, y1 = map(float, cell)
+                overlap = max(0.0, min(x1, sx1) - max(x0, sx0))
+                if overlap <= 0:
+                    continue
+                ratio = overlap / semantic_width
+                cell_width = max(1e-6, x1 - x0)
+                # Точные/почти точные ячейки столбцов превосходят гигантские объединенные ячейки, которые
+                # случайно охватывают один и тот же семантический диапазон X.
+                width_penalty = abs(cell_width - semantic_width)
+                center_penalty = abs((x0 + x1) / 2 - (sx0 + sx1) / 2)
+                score = (-width_penalty / semantic_width, ratio, -center_penalty)
+                if best is None or score > best[0]:
+                    best = (score, idx)
+            if best is not None:
+                result[key] = _cell(extracted_row[best[1]])
+        return result
+
     def _is_continuation(self, values):
         text = " ".join(v for v in values.values() if v)
         norm = _norm(text)
@@ -224,6 +252,15 @@ class GridTableParser:
             "name", "code", "series", "series_expiration", "manufacturer", "quantity", "expiration"
         ))
 
+    @staticmethod
+    def _append_current(current, values):
+        for key in ("name", "code", "series", "series_expiration", "manufacturer", "quantity", "expiration"):
+            addition = _cell(values.get(key))
+            if not addition:
+                continue
+            old = _cell(current.get(key))
+            current[key] = f"{old} {addition}" if old else addition
+
     def _current_to_product(self, current):
         number_text = _cell(current.get("number"))
         name = _cell(current.get("name"))
@@ -242,6 +279,10 @@ class GridTableParser:
                 series = combined_series
             if not expiration:
                 expiration = combined_expiration
+
+        series, embedded_expiration = self._normalize_series_cell(series)
+        if not expiration and embedded_expiration:
+            expiration = embedded_expiration
         
         if series:
             series = series.lstrip("'’")
@@ -256,192 +297,34 @@ class GridTableParser:
             expiration_date=self._expiration(expiration),
         )
 
-    def _values_to_product(self, values):
-        number_text = _cell(values.get("number"))
-        if not number_text or not re.fullmatch(r"\d{1,5}", number_text):
-            return None
-
-        name = _cell(values.get("name"))
-        if not name or not re.search(r"[A-Za-zА-Яа-я]", name):
-            return None
-
-        series = _cell(values.get("series"))
-        if series:
-            series = series.lstrip("'’")
-
-        return RegistryProduct(
-            line_number=int(number_text),
-            name=name,
-            product_code=_cell(values.get("code")),
-            series=series,
-            manufacturer=_cell(values.get("manufacturer")),
-            quantity=self._decimal(_cell(values.get("quantity"))),
-            expiration_date=self._expiration(_cell(values.get("expiration"))),
-        )
-
-    def _detect_schema(self, rows):
-        best = None
-
-        # Детектор таблиц PDF может добавлять строку метаданных перед фактическим заголовком
-        # (например, информация о поставщике/покупателе, объединенная по всей ширине таблицы).
-        # Поэтому не следует предполагать, что rows[0] является заголовком.
-        # Сканирует короткие окна в верхней части и выбирайте наиболее полную семантическую карту.
-        max_start = min(6, len(rows))
-        for start in range(max_start):
-            for count in range(1, min(4, len(rows) - start) + 1):
-                window = rows[start:start + count]
-                width = max(len(r) for r in window)
-                combined = []
-                for col in range(width):
-                    parts = []
-                    for r in window:
-                        if col < len(r) and r[col]:
-                            parts.append(str(r[col]))
-                    combined.append(_norm(" ".join(parts)))
-
-                schema = {}
-                for idx, text in enumerate(combined):
-                    match = self._classify_header(text)
-                    if match:
-                        key, match_score = match
-                        old = schema.get(key)
-                        if old is None or match_score > old[1]:
-                            schema[key] = (idx, match_score)
-
-                if not self.REQUIRED.issubset(schema):
-                    continue
-
-                semantic = {k: v[0] for k, v in schema.items()}
-                semantic_count = len(semantic)
-                raw_score = 0.58 + 0.055 * semantic_count
-                if {"series", "manufacturer", "expiration"}.issubset(semantic):
-                    raw_score += 0.08
-                if "quantity" in semantic:
-                    raw_score += 0.03
-
-                # Ранжирование в первую очередь осуществляется по количеству найденных уникальных семантических столбцов.
-                # Это позволяет избежать ситуации, когда широкое окно метаданных + заголовка превосходит
-                # чистый заголовок в одну строку после ограничения оценки. Предпочтительнее использовать более короткие
-                # окна и более ранние заголовки только в качестве критерия разрешения спорных ситуаций.
-                rank = (semantic_count, raw_score, -count, -start)
-                candidate = (rank, semantic, count, start, raw_score)
-                if best is None or candidate[0] > best[0]:
-                    best = candidate
-
-        if best is None:
-            return None, 0, 0
-
-        _, semantic, count, start, raw_score = best
-        return semantic, count, min(raw_score, 0.995)
-
-    def _classify_header(self, text):
-        if not text:
-            return None
-
-        # Перед более общим отдельным псевдонимом "серии" необходимо проверить 
-        # объединенный семантический столбец, иначе "Серия / Срок годности"
-        # будет классифицировано просто как "серия".
-        combined = _norm(text)
-        for alias in self.ALIASES.get("series_expiration", ()):
-            a = _norm(alias)
-            if combined == a or (len(a) >= 5 and a in combined):
-                return ("series_expiration", 1.0)
-
-        best = None
-        for key, aliases in self.ALIASES.items():
-            if key == "series_expiration":
-                continue
-            for alias in aliases:
-                a = _norm(alias)
-                score = None
-                if text == a:
-                    score = 1.0
-                elif len(a) >= 5 and a in text:
-                    score = 0.92
-                elif len(text) >= 5 and text in a:
-                    score = 0.86
-                if score is not None and (best is None or score > best[1]):
-                    best = (key, score)
-        return best
-
-    def _row_to_product(self, row, schema):
-        def get(key):
-            idx = schema.get(key)
-            if idx is None or idx >= len(row):
-                return None
-            return _cell(row[idx])
-
-        number_text = get("number")
-        if not number_text or not re.fullmatch(r"\d{1,5}", number_text):
-            return None
-
-        # Числовое "название" обычно представляет собой техническую легенду столбца.
-        # 1|2|3|... печатается под многострочным заголовком, а не продуктом.
-        name = get("name")
-        if not name or not re.search(r"[A-Za-zА-Яа-я]", name):
-            return None
-
-        quantity = self._quantity_from_raw(row, schema)
-        series = get("series")
-        expiration = get("expiration")
-
-        combined = get("series_expiration")
-        if combined:
-            combined_series, combined_expiration = self._split_series_expiration(combined)
-            if not series:
-                series = combined_series
-            if not expiration:
-                expiration = combined_expiration
-        
-        if series:
-            series = series.lstrip("'’").strip()
-
-        return RegistryProduct(
-            line_number=int(number_text),
-            name=name,
-            product_code=get("code"),
-            series=series,
-            manufacturer=get("manufacturer"),
-            quantity=quantity,
-            expiration_date=self._expiration(expiration),
-        )
-
     @staticmethod
-    def _map_physical_row(extracted_row, table_row, ranges):
-        """Map extracted cell text to semantic fields by physical X overlap."""
-        result = {}
-        cells = table_row.cells
-        for key, (sx0, sx1) in ranges.items():
-            semantic_width = max(1e-6, sx1 - sx0)
-            best = None
-            for idx, cell in enumerate(cells):
-                if cell is None or idx >= len(extracted_row):
-                    continue
-                x0, y0, x1, y1 = map(float, cell)
-                overlap = max(0.0, min(x1, sx1) - max(x0, sx0))
-                if overlap <= 0:
-                    continue
-                ratio = overlap / semantic_width
-                cell_width = max(1e-6, x1 - x0)
-                # Точные/почти точные ячейки столбцов превосходят гигантские объединенные ячейки, которые
-                # случайно охватывают один и тот же семантический диапазон X.
-                width_penalty = abs(cell_width - semantic_width)
-                center_penalty = abs((x0 + x1) / 2 - (sx0 + sx1) / 2)
-                score = (-width_penalty / semantic_width, ratio, -center_penalty)
-                if best is None or score > best[0]:
-                    best = (score, idx)
-            if best is not None:
-                result[key] = _cell(extracted_row[best[1]])
-        return result
+    def _normalize_series_cell(value):
+        """
+        Нормализация ячейки серии PDF, которая также может содержать срок действия.
 
-    @staticmethod
-    def _append_current(current, values):
-        for key in ("name", "code", "series", "series_expiration", "manufacturer", "quantity", "expiration"):
-            addition = _cell(values.get(key))
-            if not addition:
-                continue
-            old = _cell(current.get(key))
-            current[key] = f"{old} {addition}" if old else addition
+        Например:
+            "B269931, 31.12.2028 /" -> ("B269931", "31.12.2028")
+            "0526, 31.01.2031 /"    -> ("0526", "31.01.2031")
+            "AB685, 31.12.2028 /"   -> ("AB685", "31.12.2028")
+        """
+        value = _cell(value)
+        if not value:
+            return None, None
+
+        value = value.strip()
+        patterns = (
+            r"^(?P<series>.+?)\s*[,;]\s*(?P<expiration>\d{2}\.\d{2}\.\d{4})\s*/?\s*$",
+            r"^(?P<series>.+?)\s*[,;]\s*(?P<expiration>\d{2}\.\d{2}\.\d{2})\s*/?\s*$",
+        )
+        for pattern in patterns:
+            match = re.match(pattern, value)
+            if match:
+                return (
+                    match.group("series").strip().rstrip(",;/"),
+                    match.group("expiration").strip(),
+                )
+
+        return value.rstrip().rstrip("/").strip(), None
 
     @staticmethod
     def _quantity_text(value):
@@ -562,6 +445,114 @@ class GridTableParser:
         )
         return _cell(value)
 
+    def _values_to_product(self, values):
+        number_text = _cell(values.get("number"))
+        if not number_text or not re.fullmatch(r"\d{1,5}", number_text):
+            return None
+
+        name = _cell(values.get("name"))
+        if not name or not re.search(r"[A-Za-zА-Яа-я]", name):
+            return None
+
+        series = _cell(values.get("series"))
+        if series:
+            series = series.lstrip("'’")
+
+        return RegistryProduct(
+            line_number=int(number_text),
+            name=name,
+            product_code=_cell(values.get("code")),
+            series=series,
+            manufacturer=_cell(values.get("manufacturer")),
+            quantity=self._decimal(_cell(values.get("quantity"))),
+            expiration_date=self._expiration(_cell(values.get("expiration"))),
+        )
+
+    def _detect_schema(self, rows):
+        best = None
+
+        # Детектор таблиц PDF может добавлять строку метаданных перед фактическим заголовком
+        # (например, информация о поставщике/покупателе, объединенная по всей ширине таблицы).
+        # Поэтому не следует предполагать, что rows[0] является заголовком.
+        # Сканирует короткие окна в верхней части и выбирайте наиболее полную семантическую карту.
+        max_start = min(6, len(rows))
+        for start in range(max_start):
+            for count in range(1, min(4, len(rows) - start) + 1):
+                window = rows[start:start + count]
+                width = max(len(r) for r in window)
+                combined = []
+                for col in range(width):
+                    parts = []
+                    for r in window:
+                        if col < len(r) and r[col]:
+                            parts.append(str(r[col]))
+                    combined.append(_norm(" ".join(parts)))
+
+                schema = {}
+                for idx, text in enumerate(combined):
+                    match = self._classify_header(text)
+                    if match:
+                        key, match_score = match
+                        old = schema.get(key)
+                        if old is None or match_score > old[1]:
+                            schema[key] = (idx, match_score)
+
+                if not self.REQUIRED.issubset(schema):
+                    continue
+
+                semantic = {k: v[0] for k, v in schema.items()}
+                semantic_count = len(semantic)
+                raw_score = 0.58 + 0.055 * semantic_count
+                if {"series", "manufacturer", "expiration"}.issubset(semantic):
+                    raw_score += 0.08
+                if "quantity" in semantic:
+                    raw_score += 0.03
+
+                # Ранжирование в первую очередь осуществляется по количеству найденных уникальных семантических столбцов.
+                # Это позволяет избежать ситуации, когда широкое окно метаданных + заголовка превосходит
+                # чистый заголовок в одну строку после ограничения оценки. Предпочтительнее использовать более короткие
+                # окна и более ранние заголовки только в качестве критерия разрешения спорных ситуаций.
+                rank = (semantic_count, raw_score, -count, -start)
+                candidate = (rank, semantic, count, start, raw_score)
+                if best is None or candidate[0] > best[0]:
+                    best = candidate
+
+        if best is None:
+            return None, 0, 0
+
+        _, semantic, count, start, raw_score = best
+        return semantic, count, min(raw_score, 0.995)
+
+    def _classify_header(self, text):
+        if not text:
+            return None
+
+        # Перед более общим отдельным псевдонимом "серии" необходимо проверить 
+        # объединенный семантический столбец, иначе "Серия / Срок годности"
+        # будет классифицировано просто как "серия".
+        combined = _norm(text)
+        for alias in self.ALIASES.get("series_expiration", ()):
+            a = _norm(alias)
+            if combined == a or (len(a) >= 5 and a in combined):
+                return ("series_expiration", 1.0)
+
+        best = None
+        for key, aliases in self.ALIASES.items():
+            if key == "series_expiration":
+                continue
+            for alias in aliases:
+                a = _norm(alias)
+                score = None
+                if text == a:
+                    score = 1.0
+                elif len(a) >= 5 and a in text:
+                    score = 0.92
+                elif len(text) >= 5 and text in a:
+                    score = 0.86
+                if score is not None and (best is None or score > best[1]):
+                    best = (key, score)
+        return best
+
     @staticmethod
     def _looks_like_data_row(row):
         if not row:
@@ -574,10 +565,52 @@ class GridTableParser:
                 return True
         return False
 
+    def _row_to_product(self, row, schema):
+        def get(key):
+            idx = schema.get(key)
+            if idx is None or idx >= len(row):
+                return None
+            return _cell(row[idx])
+
+        number_text = get("number")
+        if not number_text or not re.fullmatch(r"\d{1,5}", number_text):
+            return None
+
+        # Числовое "название" обычно представляет собой техническую легенду столбца.
+        # 1|2|3|... печатается под многострочным заголовком, а не продуктом.
+        name = get("name")
+        if not name or not re.search(r"[A-Za-zА-Яа-я]", name):
+            return None
+
+        quantity = self._quantity_from_raw(row, schema)
+        series = get("series")
+        expiration = get("expiration")
+
+        combined = get("series_expiration")
+        if combined:
+            combined_series, combined_expiration = self._split_series_expiration(combined)
+            if not series:
+                series = combined_series
+            if not expiration:
+                expiration = combined_expiration
+        
+        if series:
+            series = series.lstrip("'’").strip()
+
+        return RegistryProduct(
+            line_number=int(number_text),
+            name=name,
+            product_code=get("code"),
+            series=series,
+            manufacturer=get("manufacturer"),
+            quantity=quantity,
+            expiration_date=self._expiration(expiration),
+        )
+
     @staticmethod
     def _split_series_expiration(value):
         """
-        Разделяет объединенную ячейку, например:
+        Разделите объединенную ячейку, например:
             "Y0C521M(М-8); 31.07.2026"
             "5PZ0152; 31.12.2026"
             "Н4450326; 28.02.2029"
@@ -682,6 +715,10 @@ class CoordinateRegistryParser:
             "Не удалось автоматически определить колонки реестра"
         )
 
+    @staticmethod
+    def _words(page) -> list[Word]:
+        return [tuple(w) for w in page.get_text("words", sort=True)]
+
     def _parse_pages(self, pages, layout):
         products = []
         current = None
@@ -715,6 +752,13 @@ class CoordinateRegistryParser:
         if current is not None:
             products.append(self._finalize(current))
         return products
+
+    @staticmethod
+    def _table_stop_y(words):
+        markers = {"Примечание:", "Проверил", "Ответственное", "М.П."}
+        ys = [w[1] for w in words if w[4] in markers]
+        ys += [w[1] for w in words if w[4].startswith("*") and w[1] > 400]
+        return min(ys) if ys else 10_000
 
     def _row_starts(self, words, layout, previous_number):
         x0, x1 = layout.number
@@ -763,6 +807,21 @@ class CoordinateRegistryParser:
             if selected:
                 row[key].append(self._join_words(selected))
 
+    @staticmethod
+    def _join_words(words):
+        lines = []
+        for w in sorted(words, key=lambda z: (round(z[1], 1), z[0])):
+            for line in lines:
+                if abs(line[0] - w[1]) <= 2.2:
+                    line[1].append(w)
+                    break
+            else:
+                lines.append([w[1], [w]])
+        return " ".join(
+            " ".join(q[4] for q in sorted(ws, key=lambda z: z[0]))
+            for _, ws in lines
+        ).strip()
+
     def _finalize(self, row):
         text = lambda k: self._clean(" ".join(row[k])) or None
         series = text("series")
@@ -783,32 +842,6 @@ class CoordinateRegistryParser:
             quantity=quantity,
             expiration_date=GridTableParser._expiration(text("expiration")),
         )
-
-    @staticmethod
-    def _words(page) -> list[Word]:
-        return [tuple(w) for w in page.get_text("words", sort=True)]
-
-    @staticmethod
-    def _table_stop_y(words):
-        markers = {"Примечание:", "Проверил", "Ответственное", "М.П."}
-        ys = [w[1] for w in words if w[4] in markers]
-        ys += [w[1] for w in words if w[4].startswith("*") and w[1] > 400]
-        return min(ys) if ys else 10_000
-
-    @staticmethod
-    def _join_words(words):
-        lines = []
-        for w in sorted(words, key=lambda z: (round(z[1], 1), z[0])):
-            for line in lines:
-                if abs(line[0] - w[1]) <= 2.2:
-                    line[1].append(w)
-                    break
-            else:
-                lines.append([w[1], [w]])
-        return " ".join(
-            " ".join(q[4] for q in sorted(ws, key=lambda z: z[0]))
-            for _, ws in lines
-        ).strip()
 
     @staticmethod
     def _clean(s):
@@ -895,7 +928,7 @@ class PDFRegistryParser:
     @staticmethod
     def _fingerprint(indices):
         order = (
-            "number", "code", "name", "series", "series_expiration"
+            "number", "code", "name", "series", "series_expiration",
             "quantity", "expiration", "manufacturer",
         )
         return "+".join(k for k in order if k in indices)
