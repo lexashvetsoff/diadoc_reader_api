@@ -3,6 +3,7 @@ from pathlib import Path
 from app.services.protocol_parser.models import ProtocolDocument
 from app.services.protocol_parser.pdf_parser import PDFProtocolParser
 from app.services.protocol_parser.xml_parser import XMLProtocolParser
+from app.services.protocol_parser.xlsx_parser import XLSXProtocolParser
 from app.services.protocol_parser.exceptions import UnsupportedProtocolFormatError
 
 
@@ -15,9 +16,13 @@ class ProtocolParser:
     def __init__(self):
         self.pdf_parser = PDFProtocolParser()
         self.xml_parser = XMLProtocolParser()
+        self.xlsx_parser = XLSXProtocolParser()
 
     def parse(self, source: str | Path | bytes) -> ProtocolDocument:
         raw_prefix = self._prefix(source)
+
+        if raw_prefix.startswith(b"PK\x03\x04"):
+            return self.xlsx_parser.parse(source)
 
         if raw_prefix.startswith(self.PDF_MAGIC):
             return self.pdf_parser.parse(source)

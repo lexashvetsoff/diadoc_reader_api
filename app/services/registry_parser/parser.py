@@ -4,12 +4,14 @@ from pathlib import Path
 from app.services.registry_parser.models import RegistryDocument
 from app.services.registry_parser.pdf_parser import PDFRegistryParser
 from app.services.registry_parser.xml_parser import XMLRegistryParser
+from app.services.registry_parser.xlsx_parser import XLSXRegistryParser
 from app.services.registry_parser.exceptions import RegistryParserError
 
 
 class RegistrySourceFormat(str, Enum):
     PDF = 'pdf'
     XML = 'xml'
+    XLSX = 'xlsx'
 
 
 class RegistryParser:
@@ -28,6 +30,7 @@ class RegistryParser:
     def __init__(self, *, allow_pdf_fallback: bool = True) -> None:
         self.pdf_parser = PDFRegistryParser(allow_fallback=allow_pdf_fallback)
         self.xml_parser = XMLRegistryParser()
+        self.xlsx_parser = XLSXRegistryParser()
 
     def parse(self, source: str | Path | bytes) -> RegistryDocument:
         format_ = self.detect_format(source)
@@ -35,6 +38,8 @@ class RegistryParser:
             return self.pdf_parser.parse(source)
         if format_ == RegistrySourceFormat.XML:
             return self.xml_parser.parse(source)
+        if format_ == RegistrySourceFormat.XLSX:
+            return self.xlsx_parser.parse(source)
         raise RegistryParserError('Неподдерживаемый формат реестра')
 
     @staticmethod
@@ -50,6 +55,8 @@ class RegistryParser:
                 raise RegistryParserError(f'Не удалось открыть файл: {e}') from e
 
         stripped = head.lstrip(b'\xef\xbb\xbf\x00\t\r\n ')
+        if stripped.startswith(b'PK\x03\x04'):
+            return RegistrySourceFormat.XLSX
         if stripped.startswith(b'%PDF-'):
             return RegistrySourceFormat.PDF
         if stripped.startswith(b'<?xml') or stripped.startswith(b'<'):

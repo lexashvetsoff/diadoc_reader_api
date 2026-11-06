@@ -1,6 +1,7 @@
 from typing import Any
 from pathlib import Path
 from datetime import date
+from collections import defaultdict
 
 from app.services.upd_parser.parser import UPDParser
 from app.services.registry_parser.parser import RegistryParser
@@ -45,6 +46,14 @@ class UnifierDocumentBuilder:
             else {}
         )
 
+        protocol_order_only = {}
+        if protocol_doc is not None and protocol_doc.source_format == 'xlsx':
+            protocol_order_only = self._build_ordered_lot_group_map(
+                upd_doc.products, protocol_doc.products,
+            )
+            for line, src_index in protocol_order_only.items():
+                protocol_positional.setdefault(line, src_index)
+
         registry_map = {}
         used_registry = set()
 
@@ -79,11 +88,29 @@ class UnifierDocumentBuilder:
                     source_product = protocol_doc.products[positional_idx]
                     used_protocol.add(positional_idx)
                     protocol_map[upd_product.line_number] = source_product
-                    report.protocol_matches.append(
-                        self._positional_duplicate_decision(
-                            "protocol", upd_product.line_number, source_product
+                    if upd_product.line_number in protocol_order_only:
+                        report.protocol_matches.append(MatchDecision(
+                            source="protocol", upd_line_number=upd_product.line_number,
+                            status="matched", source_line_number=source_product.line_number,
+                            score=None, method="positional_order_assumed",
+                            evidence=["same_product_name", "equal_group_cardinality", "source_order_assumption"],
+                        ))
+                        report.warnings.append(MergeWarning(
+                            code="series_assigned_by_order",
+                            upd_line_number=upd_product.line_number,
+                            field="series",
+                            message=(
+                                "Серия из XLSX-протокола назначена по порядку строк "
+                                "одинакового товара; в УПД серия отсутствует и "
+                                "независимого подтверждения соответствия партий нет"
+                            ),
+                        ))
+                    else:
+                        report.protocol_matches.append(
+                            self._positional_duplicate_decision(
+                                "protocol", upd_product.line_number, source_product
+                            )
                         )
-                    )
                     continue
 
                 reg_hint = registry_map.get(upd_product.line_number)
@@ -138,87 +165,44 @@ class UnifierDocumentBuilder:
             report=report
         )
 
-    def _merge_product(self, upd, reg, prot, report):
-        series = self._pick_with_conflict(
-            'series',
-            upd.line_number,
-            [
-                ('registry', getattr(reg, 'series', None)),
-                ('upd', getattr(upd, 'series', None)),
-                ('protocol', getattr(prot, 'series', None))
-            ],
-            report,
-            normalizer=normalize_series
-        )
+    @staticmethod
+    def _build_ordered_lot_group_map(upd_products, source_products):
+        """Order-only fallback for unlabelled lots in XLSX regulatory protocols.
 
-        manufacturer = self._pick_with_conflict(
-            'manufacturer',
-            upd.line_number,
-            [
-                ('registry', getattr(reg, 'manufacturer', None)),
-                ('protocol', getattr(prot, 'manufacturer', None)),
-            ],
-            report
-        )
+        Both groups must have identical counts, matching semantic names, and
+        all UPD rows must lack batch IDs. It never applies to single products,
+        mixed product groups, or known conflicting batch identifiers.
+        Explicitly report these matches as assumptions in the merge report.
+        """
 
-        registry_exp = getattr(reg, 'expiration_date', None)
-        upd_exp = getattr(upd, 'expiration_date', None)
-        upd_exp_text = (
-            upd_exp.strftime("%d.%m.%Y")
-            if isinstance(upd_exp, date)
-            else str(upd_exp) if upd_exp not in (None, "") else None
-        )
-        expiration = self._pick_with_conflict(
-            'expiration_date',
-            upd.line_number,
-            [
-                ('registry', registry_exp),
-                ('upd', upd_exp_text)
-            ],
-            report
-        )
+        def identity(name):
+            # Protocol names may append a GTIN after a comma.
+            return normalize_name(name)
 
-        return UnifiedProduct(
-            line_number=upd.line_number,
-            name=upd.name,
-            product_code=upd.product_code,
-            unit=upd.unit,
-            okei=upd.okei,
-            quantity=upd.quantity,
-            price=upd.price,
-            amount_without_vat=upd.amount_without_vat,
-            vat_rate=upd.vat_rate,
-            vat_amount=upd.vat_amount,
-            amount_with_vat=upd.amount_with_vat,
-            gtin=upd.gtin,
+        upd_groups = defaultdict(list)
+        src_groups = defaultdict(list)
+        for i, p in enumerate(upd_products):
+            upd_groups[identity(p.name)].append((i, p))
+        for i, p in enumerate(source_products):
+            src_groups[identity(p.name)].append((i, p))
 
-            series=series,
-            manufacturer=manufacturer,
-            manufacturer_actual_price_without_vat=getattr(
-                prot, 'manufacturer_actual_price_without_vat', None
-            ),
-            manufacturer_regulated_price=getattr(
-                prot, 'manufacturer_regulated_price', None
-            ),
-            wholesale_price=getattr(prot, 'wholesale_price', None),
-            expiration_date=expiration,
-            manufacturer_sale_date=getattr(prot, 'manufacturer_sale_date', None),
-        )
-
-    def _ensure_upd(self, value):
-        if hasattr(value, 'products') and hasattr(value, 'document_number'):
-            return value
-        return self.upd_parser.parse(value)
-
-    def _ensure_registry(self, value):
-        if hasattr(value, 'products') and hasattr(value, 'source_layout'):
-            return value
-        return self.registry_parser.parse(value)
-
-    def _ensure_protocol(self, value):
-        if hasattr(value, 'products') and hasattr(value, 'source_format'):
-            return value
-        return self.protocol_parser.parse(value)
+        result = {}
+        for name, upd_group in upd_groups.items():
+            source_group = src_groups.get(name, [])
+            if not (len(upd_group) > 1 and len(upd_group) == len(source_group)):
+                continue
+            if any(getattr(p, 'series', None) for _, p in upd_group):
+                continue
+            if not all(getattr(p, 'series', None) for _, p in source_group):
+                continue
+            # Ensure both groups are contiguous in their respective documents.
+            if any(b[0] != a[0] + 1 for a,b in zip(upd_group,upd_group[1:])):
+                continue
+            if any(b[0] != a[0] + 1 for a,b in zip(source_group,source_group[1:])):
+                continue
+            for (_, upd_p), (src_index, _) in zip(upd_group, source_group):
+                result[upd_p.line_number] = src_index
+        return result
 
     @classmethod
     def _build_indistinguishable_duplicate_map(cls, upd_products, source_products):
@@ -321,6 +305,73 @@ class UnifierDocumentBuilder:
             ],
         )
 
+    def _merge_product(self, upd, reg, prot, report):
+        series = self._pick_with_conflict(
+            'series',
+            upd.line_number,
+            [
+                ('registry', getattr(reg, 'series', None)),
+                ('upd', getattr(upd, 'series', None)),
+                ('protocol', getattr(prot, 'series', None))
+            ],
+            report,
+            normalizer=normalize_series
+        )
+
+        manufacturer = self._pick_with_conflict(
+            'manufacturer',
+            upd.line_number,
+            [
+                ('registry', getattr(reg, 'manufacturer', None)),
+                ('protocol', getattr(prot, 'manufacturer', None)),
+            ],
+            report
+        )
+
+        registry_exp = getattr(reg, 'expiration_date', None)
+        upd_exp = getattr(upd, 'expiration_date', None)
+        upd_exp_text = (
+            upd_exp.strftime("%d.%m.%Y")
+            if isinstance(upd_exp, date)
+            else str(upd_exp) if upd_exp not in (None, "") else None
+        )
+        expiration = self._pick_with_conflict(
+            'expiration_date',
+            upd.line_number,
+            [
+                ('registry', registry_exp),
+                ('upd', upd_exp_text)
+            ],
+            report
+        )
+
+        return UnifiedProduct(
+            line_number=upd.line_number,
+            name=upd.name,
+            product_code=upd.product_code,
+            unit=upd.unit,
+            okei=upd.okei,
+            quantity=upd.quantity,
+            price=upd.price,
+            amount_without_vat=upd.amount_without_vat,
+            vat_rate=upd.vat_rate,
+            vat_amount=upd.vat_amount,
+            amount_with_vat=upd.amount_with_vat,
+            gtin=upd.gtin,
+
+            series=series,
+            manufacturer=manufacturer,
+            manufacturer_actual_price_without_vat=getattr(
+                prot, 'manufacturer_actual_price_without_vat', None
+            ),
+            manufacturer_regulated_price=getattr(
+                prot, 'manufacturer_regulated_price', None
+            ),
+            wholesale_price=getattr(prot, 'wholesale_price', None),
+            expiration_date=expiration,
+            manufacturer_sale_date=getattr(prot, 'manufacturer_sale_date', None),
+        )
+
     @staticmethod
     def _pick_with_conflict(field, line, values, report, normalizer=None):
         present = [(source, value) for source, value in values if value not in (None, '')]
@@ -395,3 +446,18 @@ class UnifierDocumentBuilder:
                         message=f"УПД №{upd_no} и основание протокола №{basis_no} различаются",
                     )
                 )
+
+    def _ensure_upd(self, value):
+        if hasattr(value, 'products') and hasattr(value, 'document_number'):
+            return value
+        return self.upd_parser.parse(value)
+
+    def _ensure_registry(self, value):
+        if hasattr(value, 'products') and hasattr(value, 'source_layout'):
+            return value
+        return self.registry_parser.parse(value)
+
+    def _ensure_protocol(self, value):
+        if hasattr(value, 'products') and hasattr(value, 'source_format'):
+            return value
+        return self.protocol_parser.parse(value)
