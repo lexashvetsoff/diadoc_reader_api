@@ -101,6 +101,18 @@ class ProductNameParser:
         re.IGNORECASE | re.VERBOSE,
     )
 
+    _PAREN_SERIES_MONTH_YEAR_PATTERN = re.compile(
+        r"""
+        \s*\(
+            \s*(?P<series>[A-Za-zА-Яа-я0-9-]{3,32})
+            \s+(?:годен\s+до|срок\s+годности)\s*
+            (?P<month>0[1-9]|1[0-2])\s*[/.]\s*(?P<year>\d{4})
+            \s*
+        \)\s*$
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    )
+
     _PAREN_SERIES_TO_DATE_PATTERN = re.compile(
         r"""
         \s*
@@ -153,7 +165,7 @@ class ProductNameParser:
 
     _PAREN_PATTERN = re.compile(
         r"\(\s*(?P<series>[^(),]+?)\s*,\s*"
-        r"(?P<date>\d{2}\.\d{2}\.\d{4})\s*\)\s*$",
+        r"(?P<date>\d{2}\.\d{2}\.(?:\d{4}|\d{2}))\s*\)\s*$",
         re.IGNORECASE,
     )
 
@@ -162,7 +174,7 @@ class ProductNameParser:
         \s*
         \(
             \s*(?:серия|сер\.?)\s+
-            (?P<series>[A-Za-zА-Яа-я0-9()\-]+)
+            (?P<series>[A-Za-zА-Яа-я0-9()\-/]+)
             \s*;\s*
             до\s+
             (?P<date>\d{2}\.\d{2}\.\d{4})
@@ -189,6 +201,19 @@ class ProductNameParser:
             (?P<date>\d{2}\.\d{2}\.\d{4})
             \s*
         \)
+        \s*$
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    )
+
+    _TEXT_SERIES_COMMA_TO_DATE_PATTERN = re.compile(
+        r"""
+        \s*,?\s+
+        (?:серия|сер\.?)\s+
+        (?P<series>[A-Za-zА-Яа-я0-9()\-]+)
+        \s*[,;]\s*
+        до\s+
+        (?P<date>\d{2}\.\d{2}\.(?:\d{2}|\d{4}))
         \s*$
         """,
         re.IGNORECASE | re.VERBOSE,
@@ -236,6 +261,17 @@ class ProductNameParser:
     def parse(self, raw_name: str | None) -> ParsedProductName:
         raw = (raw_name or "").strip()
 
+        match = self._TEXT_SERIES_COMMA_TO_DATE_PATTERN.search(raw)
+        if match:
+            raw_expiry = match.group("date")
+            date_format = "%d.%m.%Y" if len(raw_expiry.rsplit(".", 1)[-1]) == 4 else "%d.%m.%y"
+            return ParsedProductName(
+                raw_name=raw,
+                name=raw[:match.start()].rstrip(" ,;"),
+                series=match.group("series"),
+                expiration_date=datetime.strptime(raw_expiry, date_format).date(),
+            )
+
         # Форма "месяц-год" обрабатывается отдельно, поскольку преобразование
         # "03.2029" в дату привело бы к созданию неизвестного дня.
         match = self._PAREN_SERIES_FROM_TO_PATTERN.search(raw)
@@ -245,7 +281,7 @@ class ProductNameParser:
             return ParsedProductName(
                 raw_name=raw,
                 name=raw[:match.start()].rstrip(" ,;"),
-                series=match.group("series").strip(" ,;") or None,
+                series=re.sub(r"(?i)^(?:серия|сер\.?)\s*[:№-]?\s*", "", match.group("series")).strip(" ,;") or None,
                 expiration_date=datetime.strptime(raw_expiry, date_format).date(),
             )
 
@@ -258,6 +294,15 @@ class ProductNameParser:
                 name=raw[:match.start()].rstrip(" ,;"),
                 series=match.group("series").strip(" ,;") or None,
                 expiration_date=match.group("month"),
+            )
+
+        match = self._PAREN_SERIES_MONTH_YEAR_PATTERN.search(raw)
+        if match:
+            return ParsedProductName(
+                raw_name=raw,
+                name=raw[:match.start()].rstrip(" ,;"),
+                series=match.group("series"),
+                expiration_date=f"{match.group('month')}.{match.group('year')}",
             )
 
         match = self._PAREN_SERIES_TO_DATE_AUX_PATTERN.search(raw)
@@ -340,7 +385,8 @@ class ProductNameParser:
                 name=raw[:match.start()].rstrip(" ,;"),
                 series=match.group("series").strip(" ,;") or None,
                 expiration_date=datetime.strptime(
-                    match.group("date"), "%d.%m.%Y"
+                    match.group("date"),
+                    "%d.%m.%Y" if len(match.group("date").rsplit(".", 1)[-1]) == 4 else "%d.%m.%y",
                 ).date(),
             )
 

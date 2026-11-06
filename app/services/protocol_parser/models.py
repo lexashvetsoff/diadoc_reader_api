@@ -16,6 +16,7 @@ class ProtocolProduct(BaseModel):
     quantity: Decimal | None = None
     wholesale_price: Decimal | None = None
     manufacturer_sale_date: date | None = None
+    expiration_date: str | None = None
 
 
 class ProtocolDocument(BaseModel):

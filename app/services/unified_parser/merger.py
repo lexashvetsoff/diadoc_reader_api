@@ -2,11 +2,19 @@ from typing import Any
 from pathlib import Path
 from datetime import date
 from collections import defaultdict
+from decimal import Decimal, InvalidOperation
 
 from app.services.upd_parser.parser import UPDParser
 from app.services.registry_parser.parser import RegistryParser
 from app.services.protocol_parser.parser import ProtocolParser
-from app.services.unified_parser.matching import ProductMatcher, normalize_series, normalize_product_code, normalize_name
+from app.services.unified_parser.matching import (
+    ProductMatcher, 
+    normalize_series, 
+    normalize_product_code, 
+    normalize_name,
+    name_similarity,
+    same_product_identity
+)
 from app.services.unified_parser.models import MatchDecision, MergeReport, MergeResult, MergeWarning, UnifiedDocument, UnifiedProduct
 
 
@@ -113,6 +121,29 @@ class UnifierDocumentBuilder:
                         )
                     continue
 
+                # Сопоставление позиций в PDF-документах с учетом цены. В регуляторных графах может быть указана оптовая цена с учетом НДС, 
+                # тогда как цена за единицу в универсальном передаточном документе (УПД) приводится без НДС. Уникальная комбинация «цена + наименование» 
+                # позволяет идентифицировать строку, даже если в УПД отсутствует информация о серии товара. Категорически не допускается определять 
+                # партию товара исключительно на основании порядка следования строк или только по цене.
+                if protocol_doc.source_format == "pdf":
+                    price_idx = self._unique_protocol_wholesale_vat_match(
+                        upd_product, protocol_doc.products, used_protocol
+                    )
+                    if price_idx is not None:
+                        source_product = protocol_doc.products[price_idx]
+                        used_protocol.add(price_idx)
+                        protocol_map[upd_product.line_number] = source_product
+                        report.protocol_matches.append(MatchDecision(
+                            source="protocol",
+                            upd_line_number=upd_product.line_number,
+                            status="matched",
+                            source_line_number=source_product.line_number,
+                            score=None,
+                            method="name_price_vat",
+                            evidence=["same_product_identity", "name_similarity>=0.55", "unique_wholesale_vat_price"],
+                        ))
+                        continue
+
                 reg_hint = registry_map.get(upd_product.line_number)
                 status, best, _ = self.matcher.choose(upd_product, protocol_doc.products, hint=reg_hint, used=used_protocol)
                 decision = self._decision('protocol', upd_product.line_number, status, best)
@@ -166,17 +197,77 @@ class UnifierDocumentBuilder:
         )
 
     @staticmethod
+    def _compatible_strength_and_pack(upd_name, candidate_name):
+        import re
+
+        def strength(text):
+            m = re.search(r"(\d+(?:[.,]\d+)?)\s*мг", text or "", re.I)
+            return Decimal(m.group(1).replace(",", ".")) if m else None
+
+        def pack_size(text):
+            text = text or ""
+            m = re.search(r"(\d+)\s*шт\.?\s*[-–]?\s*блистер\s*\((\d+)\)", text, re.I)
+            if m:
+                return int(m.group(1)) * int(m.group(2))
+            m = re.search(r"№\s*(\d+)", text)
+            if m:
+                return int(m.group(1))
+            m = re.search(r"(\d+)\s*шт\.?", text, re.I)
+            return int(m.group(1)) if m else None
+
+        a_strength, b_strength = strength(upd_name), strength(candidate_name)
+        if a_strength is not None and b_strength is not None and a_strength != b_strength:
+            return False
+        a_pack, b_pack = pack_size(upd_name), pack_size(candidate_name)
+        if a_pack is not None and b_pack is not None and a_pack != b_pack:
+            return False
+        return True
+
+    @staticmethod
+    def _unique_protocol_wholesale_vat_match(upd_product, candidates, used_indices):
+        upd_price = getattr(upd_product, "price", None)
+        vat_text = str(getattr(upd_product, "vat_rate", "") or "")
+        if upd_price is None:
+            return None
+        import re
+        match = re.fullmatch(r"\s*(\d+(?:[.,]\d+)?)\s*%\s*", vat_text)
+        if not match:
+            return None
+        try:
+            multiplier = Decimal("1") + Decimal(match.group(1).replace(",", ".")) / 100
+        except InvalidOperation:
+            return None
+        if multiplier <= 0:
+            return None
+
+        possible = []
+        source_series = normalize_series(getattr(upd_product, "series", None))
+        for idx, candidate in enumerate(candidates):
+            if idx in used_indices or candidate.wholesale_price is None:
+                continue
+            if not same_product_identity(upd_product.name, candidate.name):
+                continue
+            if name_similarity(upd_product.name, candidate.name) < 0.55:
+                continue
+            # Сравнение дозировки и фактического количества таблеток в упаковке: у
+            # одного и того же бренда могут быть разные варианты дозировки и размеры упаковок. Это также
+            # позволяет сопоставить, например, «20 шт. — блистер (3)» и «№ 60».
+            if not UnifierDocumentBuilder._compatible_strength_and_pack(
+                upd_product.name, candidate.name
+            ):
+                continue
+            candidate_series = normalize_series(candidate.series)
+            if source_series and candidate_series and source_series != candidate_series:
+                continue
+            # Исходная цена (с учетом НДС) обычно округляется до копеек. 
+            # Допуск учитывает округление, не допуская при этом смешивания упаковок с разными ценами.
+            if abs(candidate.wholesale_price - upd_price * multiplier) <= Decimal("0.025"):
+                possible.append(idx)
+        return possible[0] if len(possible) == 1 else None
+
+    @staticmethod
     def _build_ordered_lot_group_map(upd_products, source_products):
-        """Order-only fallback for unlabelled lots in XLSX regulatory protocols.
-
-        Both groups must have identical counts, matching semantic names, and
-        all UPD rows must lack batch IDs. It never applies to single products,
-        mixed product groups, or known conflicting batch identifiers.
-        Explicitly report these matches as assumptions in the merge report.
-        """
-
         def identity(name):
-            # Protocol names may append a GTIN after a comma.
             return normalize_name(name)
 
         upd_groups = defaultdict(list)
@@ -195,7 +286,6 @@ class UnifierDocumentBuilder:
                 continue
             if not all(getattr(p, 'series', None) for _, p in source_group):
                 continue
-            # Ensure both groups are contiguous in their respective documents.
             if any(b[0] != a[0] + 1 for a,b in zip(upd_group,upd_group[1:])):
                 continue
             if any(b[0] != a[0] + 1 for a,b in zip(source_group,source_group[1:])):
@@ -340,7 +430,8 @@ class UnifierDocumentBuilder:
             upd.line_number,
             [
                 ('registry', registry_exp),
-                ('upd', upd_exp_text)
+                ('upd', upd_exp_text),
+                ('protocol', getattr(prot, 'expiration_date', None))
             ],
             report
         )

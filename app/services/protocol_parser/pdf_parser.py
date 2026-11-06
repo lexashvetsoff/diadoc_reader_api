@@ -218,7 +218,8 @@ class PDFProtocolParser:
                 continue
 
             def idx(pred):
-                return next((i for i, x in enumerate(squashed) if pred(x)), None)
+                matches = (i for i, value in enumerate(squashed) if pred(value))
+                return min(matches, key=lambda i: (len(squashed[i]), i), default=None)
 
             name_i = idx(has_name)
             series_i = idx(lambda x: "серия" in x)
@@ -499,6 +500,13 @@ class PDFProtocolParser:
         value = cls._clean_pdf_text(value)
         if not value:
             return None
+
+        # "030926 от 02.09.26 до 30.09.29" -> "030926".
+        value = re.sub(
+            r"(?i)\s+от\s+\d{2}\.\d{2}\.(?:\d{2}|\d{4})"
+            r"\s+до\s+\d{2}\.\d{2}\.(?:\d{2}|\d{4})\s*$",
+            "", value,
+        )
 
         # Некоторые печатают срок действия в одной и той же ячейке физического ряда
         value = re.sub(
