@@ -13,6 +13,18 @@ class ParsedProductName:
 
 class ProductNameParser:
     """Извлечение серии/срока действия, встроенных в название продукта."""
+    _NESTED_MONTH_2D_PATTERN = re.compile(
+        r"""
+        \s*\(
+            \s*(?P<series>[A-Za-zА-Яа-я0-9/-]{3,32})
+            \s+\(\s*(?P<month>0[1-9]|1[0-2])\.(?P<year>\d{4})\s*\)
+            \s+\(\s*2\s*D\s*[-–—]?\s*код\s*\)
+            \s*
+        \)\s*$
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    )
+
     _NESTED_AUX_MONTH_PATTERN = re.compile(
         r"""
         \s*
@@ -270,6 +282,15 @@ class ProductNameParser:
                 name=raw[:match.start()].rstrip(" ,;"),
                 series=match.group("series"),
                 expiration_date=datetime.strptime(raw_expiry, date_format).date(),
+            )
+
+        match = self._NESTED_MONTH_2D_PATTERN.search(raw)
+        if match:
+            return ParsedProductName(
+                raw_name=raw,
+                name=raw[:match.start()].rstrip(" ,;"),
+                series=match.group("series"),
+                expiration_date=f"{match.group('month')}.{match.group('year')}",
             )
 
         # Форма "месяц-год" обрабатывается отдельно, поскольку преобразование
