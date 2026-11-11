@@ -1,6 +1,7 @@
 from typing import Any
 from pathlib import Path
 from datetime import date
+from loguru import logger
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 
@@ -33,10 +34,16 @@ class UnifierDocumentBuilder:
 
     def build(self, upd, registry=None, protocol=None) -> MergeResult:
         upd_doc = self._ensure_upd(upd)
-        registry_doc = self._ensure_registry(registry) if registry is not None else None
-        protocol_doc = self._ensure_protocol(protocol) if protocol is not None else None
+        # registry_doc = self._ensure_registry(registry) if registry is not None else None
+        # protocol_doc = self._ensure_protocol(protocol) if protocol is not None else None
 
         report = MergeReport()
+
+        # Реестр и протокол — это дополнительные документы, служащие для обогащения данных. 
+        # Некорректно сформированное, пустое или неподдерживаемое вложение не должно приводить к прерыванию.
+        registry_doc = self._try_optional_document("registry", registry, report)
+        protocol_doc = self._try_optional_document("protocol", protocol, report)
+
         self._document_level_warnings(upd_doc, registry_doc, protocol_doc, report)
 
         registry_positional = (
@@ -55,9 +62,10 @@ class UnifierDocumentBuilder:
         )
 
         protocol_order_only = {}
-        if protocol_doc is not None and protocol_doc.source_format == 'xlsx':
+        if protocol_doc is not None and protocol_doc.source_format in ('xlsx', 'xml'):
             protocol_order_only = self._build_ordered_lot_group_map(
                 upd_doc.products, protocol_doc.products,
+                require_exact_code=(protocol_doc.source_format == 'xml'),
             )
             for line, src_index in protocol_order_only.items():
                 protocol_positional.setdefault(line, src_index)
@@ -79,7 +87,52 @@ class UnifierDocumentBuilder:
                     )
                     continue
 
-                status, best, _ = self.matcher.choose(upd_product, registry_doc.products, used=used_registry)
+                excluded_registry = set(used_registry)
+                if registry_doc.layout_source == "xls":
+                    name_key = normalize_name(upd_product.name)
+                    same_name_rows = [
+                        (idx, product)
+                        for idx, product in enumerate(registry_doc.products)
+                        if normalize_name(product.name) == name_key
+                    ]
+                    for idx, product in enumerate(registry_doc.products):
+                        if normalize_name(product.name) != name_key:
+                            excluded_registry.add(idx)
+                    if len(same_name_rows) > 1 and not upd_product.series:
+                        quantities = [product.quantity for _, product in same_name_rows]
+                        if (
+                            upd_product.quantity is not None
+                            and all(q is not None for q in quantities)
+                            and sum(quantities) == upd_product.quantity
+                        ):
+                            report.registry_matches.append(MatchDecision(
+                                source='registry', upd_line_number=upd_product.line_number,
+                                status='ambiguous', source_line_number=None,
+                                method='multiple_registry_lots',
+                                evidence=['same_product_name', 'sum_of_lot_quantities_equals_upd'],
+                            ))
+
+                            message = (
+                                "Одна строка УПД содержит несколько партий реестра: "
+                                + ", ".join(
+                                    f"{product.series} ({product.quantity})"
+                                    for _, product in same_name_rows
+                                )
+                                + ". Нельзя назначить одну серию всей строке УПД."
+                            )
+                            report.warnings.append(MergeWarning(
+                                code="registry_multiple_lots_in_upd_row",
+                                upd_line_number=upd_product.line_number,
+                                field="series",
+                                message=message,
+                            ))
+                            logger.warning(message)
+                            continue
+                status, best, _ = self.matcher.choose(
+                    upd_product,
+                    registry_doc.products,
+                    used=excluded_registry,
+                )
                 decision = self._decision('registry', upd_product.line_number, status, best)
                 report.registry_matches.append(decision)
                 if status == 'matched' and best is not None:
@@ -101,18 +154,23 @@ class UnifierDocumentBuilder:
                             source="protocol", upd_line_number=upd_product.line_number,
                             status="matched", source_line_number=source_product.line_number,
                             score=None, method="positional_order_assumed",
-                            evidence=["same_product_name", "equal_group_cardinality", "source_order_assumption"],
+                            evidence=["same_product_name", "equal_group_cardinality", "source_order_assumption"] + (
+                                ["exact_product_code"] if protocol_doc.source_format == 'xml' else []
+                            ),
                         ))
+
+                        message=(
+                            "Серия из протокола назначена по порядку строк "
+                            "одинакового товара; в УПД серия отсутствует и "
+                            "независимого подтверждения соответствия партий нет"
+                        )
                         report.warnings.append(MergeWarning(
                             code="series_assigned_by_order",
                             upd_line_number=upd_product.line_number,
                             field="series",
-                            message=(
-                                "Серия из XLSX-протокола назначена по порядку строк "
-                                "одинакового товара; в УПД серия отсутствует и "
-                                "независимого подтверждения соответствия партий нет"
-                            ),
+                            message=message,
                         ))
+                        logger.warning(message)
                     else:
                         report.protocol_matches.append(
                             self._positional_duplicate_decision(
@@ -266,7 +324,7 @@ class UnifierDocumentBuilder:
         return possible[0] if len(possible) == 1 else None
 
     @staticmethod
-    def _build_ordered_lot_group_map(upd_products, source_products):
+    def _build_ordered_lot_group_map(upd_products, source_products, require_exact_code=False):
         def identity(name):
             return normalize_name(name)
 
@@ -282,6 +340,11 @@ class UnifierDocumentBuilder:
             source_group = src_groups.get(name, [])
             if not (len(upd_group) > 1 and len(upd_group) == len(source_group)):
                 continue
+            if require_exact_code:
+                upd_codes = {normalize_product_code(p.product_code) for _, p in upd_group}
+                src_codes = {normalize_product_code(p.product_code) for _, p in source_group}
+                if len(upd_codes) != 1 or upd_codes != src_codes or not next(iter(upd_codes)):
+                    continue
             if any(getattr(p, 'series', None) for _, p in upd_group):
                 continue
             if not all(getattr(p, 'series', None) for _, p in source_group):
@@ -479,17 +542,19 @@ class UnifierDocumentBuilder:
             if norm(value) != chosen_norm
         ]
         if conflicts:
+            message=(
+                f"Конфликт поля {field}: выбрано {chosen_source}={chosen!r}; "
+                + ", ".join(f"{s}={v!r}" for s, v in conflicts)
+            )
             report.warnings.append(
                 MergeWarning(
                     code='source_conflict',
                     upd_line_number=line,
                     field=field,
-                    message=(
-                        f"Конфликт поля {field}: выбрано {chosen_source}={chosen!r}; "
-                        + ", ".join(f"{s}={v!r}" for s, v in conflicts)
-                    )
+                    message=message
                 )
             )
+            logger.warning(message)
         return chosen
 
     @staticmethod
@@ -520,23 +585,54 @@ class UnifierDocumentBuilder:
         if registry is not None:
             reg_no = (registry.invoice_number or '').strip()
             if upd_no and reg_no and upd_no != reg_no:
+                message=f"УПД №{upd_no} и реестр №{reg_no} имеют разные номера"
                 report.warnings.append(
                     MergeWarning(
                         code='document_number_mismatch',
-                        message=f"УПД №{upd_no} и реестр №{reg_no} имеют разные номера"
+                        message=message
                     )
                 )
+                logger.warning(message)
 
         if protocol is not None:
             basis_no = (protocol.basis_number or '').strip()
             # Номер протокола сам по себе не должен совпадать с номером UPD.
             if upd_no and basis_no and upd_no != basis_no:
+                message=f"УПД №{upd_no} и основание протокола №{basis_no} различаются"
                 report.warnings.append(
                     MergeWarning(
                         code='basis_number_mismatch',
-                        message=f"УПД №{upd_no} и основание протокола №{basis_no} различаются",
+                        message=message,
                     )
                 )
+                logger.warning(message)
+
+    def _try_optional_document(self, kind, source, report):
+        if source is None:
+            return None
+
+        parser = self._ensure_registry if kind == "registry" else self._ensure_protocol
+        source_label = (
+            str(source) if isinstance(source, (str, Path))
+            else "<bytes>" if isinstance(source, bytes)
+            else "<parsed document>"
+        )
+        try:
+            doc = parser(source)
+            if not doc.products:
+                raise ValueError("Не обнаружены товарные строки")
+            return doc
+        except Exception as exc:
+            message=(
+                f"Документ {kind} '{source_label}' исключён из обработки: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            report.warnings.append(MergeWarning(
+                code=f"{kind}_document_skipped",
+                message=message,
+            ))
+            logger.warning(message)
+            return None
 
     def _ensure_upd(self, value):
         if hasattr(value, 'products') and hasattr(value, 'document_number'):

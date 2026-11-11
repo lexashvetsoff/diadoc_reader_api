@@ -5,6 +5,7 @@ import xml.etree.ElementTree as ET
 
 from app.services.upd_parser.models import UPDDocument, UPDProduct
 from app.services.upd_parser.name_parser import ProductNameParser
+from app.services.batch_expiry import split_batch_expiry
 
 
 class UPDParserError(Exception): pass
@@ -13,8 +14,8 @@ class UPDStructureError(UPDParserError): pass
 
 
 class UPDParser:
-    def __init__(self):
-        self.name_parser = ProductNameParser()
+    def __init__(self, name_parser: ProductNameParser | None = None):
+        self.name_parser = name_parser or ProductNameParser()
 
     def parse(self, source: str | Path | bytes) -> UPDDocument:
         root = self._load(source)
@@ -33,6 +34,15 @@ class UPDParser:
             products=tuple(self._product(x) for x in table.findall('./СведТов'))
         )
 
+    @staticmethod
+    def _load(source: str | Path | bytes) -> ET.Element:
+        try:
+            if isinstance(source, bytes):
+                return ET.fromstring(source)
+            return ET.parse(Path(source)).getroot()
+        except (ET.ParseError, OSError, UnicodeError) as exc:
+            raise UPDXMLParseError(f'Не удалось прочитать XML: {exc}') from exc
+
     def _product(self, node: ET.Element) -> UPDProduct:
         raw_line = node.get('НомСтр')
         if not raw_line:
@@ -45,6 +55,12 @@ class UPDParser:
         parsed_name = self.name_parser.parse(node.get('НаимТов'))
         info_fields = self._info_fields(node)
         extra = node.find('./ДопСведТов')
+        characteristic = extra.get('ХарактерТов') if extra is not None else None
+        characteristic_series, characteristic_expiry = split_batch_expiry(characteristic)
+        expiry_from_characteristic = (
+            self._expiration(characteristic_expiry, None)
+            if characteristic_expiry else None
+        )
         vat_node = node.find('./СумНал/СумНал')
         vat_text = vat_node.text.strip() if vat_node is not None and vat_node.text else None
 
@@ -63,14 +79,10 @@ class UPDParser:
             vat_rate=node.get('НалСт'),
             vat_amount=self._decimal(vat_text),
             amount_with_vat=self._decimal(node.get('СтТовУчНал')),
-            series=(
-                info_fields.get('НОМЕРСЕРИИ')
-                or info_fields.get('СЕРИЯ')
-                or parsed_name.series
-            ),
+            series=info_fields.get('НОМЕРСЕРИИ') or characteristic_series or parsed_name.series,
             expiration_date=self._expiration(
                 info_fields.get('СРОКГОДНОСТИ'),
-                parsed_name.expiration_date,
+                expiry_from_characteristic or parsed_name.expiration_date,
             ),
         )
 

@@ -9,6 +9,7 @@ class ProtocolProduct(BaseModel):
     line_number: int | None = None
     name: str | None = None
     product_code: str | None = None
+    gtin: str | None = None
     series: str | None = None
     manufacturer: str | None = None
     manufacturer_actual_price_without_vat: Decimal | None = None

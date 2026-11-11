@@ -420,11 +420,16 @@ class ProductMatcher:
         # либо как общее поле кода продукта. GTIN-14 с ведущим нулем
         # эквивалентен соответствующему GTIN-13 для целей сопоставления.
         gtin_candidates = {x for x in (candidate_gtin, normalize_gtin(getattr(candidate, "product_code", None))) if x}
-        if anchor_gtin and anchor_gtin in gtin_candidates:
+        anchor_code_gtin = normalize_gtin(getattr(anchor, "product_code", None))
+        anchor_barcodes = {value for value in (anchor_gtin, anchor_code_gtin)
+                           if len(value) in (13, 14)}
+        candidate_barcodes = {value for value in gtin_candidates
+                              if len(value) in (13, 14)}
+        if anchor_barcodes & candidate_barcodes:
             score += 0.62
             strong = True
             exact_identifier_match = True
-            evidence.append("exact_gtin")
+            evidence.append("exact_gtin" if anchor_gtin in candidate_barcodes else "product_code_as_gtin")
 
         anchor_series = normalize_series(getattr(anchor, "series", None))
         hint_series = normalize_series(getattr(hint, "series", None)) if hint else ""
@@ -460,11 +465,13 @@ class ProductMatcher:
             evidence.append("same_line_number")
 
         # Для отбора кандидата необходимо как минимум наличие значимого сходства имен или точного ключа.
+        if "product_code_as_gtin" in evidence and sim < 0.78:
+            return None
         if not strong and sim < 0.78:
             return None
 
         if strong:
-            if "exact_product_code" in evidence or "exact_gtin" in evidence:
+            if "exact_product_code" in evidence or "exact_gtin" in evidence or "product_code_as_gtin" in evidence:
                 method = "identifier"
             else:
                 method = "series"

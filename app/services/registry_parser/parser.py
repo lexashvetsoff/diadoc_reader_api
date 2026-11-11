@@ -5,6 +5,7 @@ from app.services.registry_parser.models import RegistryDocument
 from app.services.registry_parser.pdf_parser import PDFRegistryParser
 from app.services.registry_parser.xml_parser import XMLRegistryParser
 from app.services.registry_parser.xlsx_parser import XLSXRegistryParser
+from app.services.registry_parser.xls_parser import XLSRegistryParser
 from app.services.registry_parser.exceptions import RegistryParserError
 
 
@@ -12,6 +13,7 @@ class RegistrySourceFormat(str, Enum):
     PDF = 'pdf'
     XML = 'xml'
     XLSX = 'xlsx'
+    XLS = 'xls'
 
 
 class RegistryParser:
@@ -31,6 +33,7 @@ class RegistryParser:
         self.pdf_parser = PDFRegistryParser(allow_fallback=allow_pdf_fallback)
         self.xml_parser = XMLRegistryParser()
         self.xlsx_parser = XLSXRegistryParser()
+        self.xls_parser = XLSRegistryParser()
 
     def parse(self, source: str | Path | bytes) -> RegistryDocument:
         format_ = self.detect_format(source)
@@ -40,6 +43,8 @@ class RegistryParser:
             return self.xml_parser.parse(source)
         if format_ == RegistrySourceFormat.XLSX:
             return self.xlsx_parser.parse(source)
+        if format_ == RegistrySourceFormat.XLS:
+            return self.xls_parser.parse(source)
         raise RegistryParserError('Неподдерживаемый формат реестра')
 
     @staticmethod
@@ -55,6 +60,8 @@ class RegistryParser:
                 raise RegistryParserError(f'Не удалось открыть файл: {e}') from e
 
         stripped = head.lstrip(b'\xef\xbb\xbf\x00\t\r\n ')
+        if stripped.startswith(bytes.fromhex('d0cf11e0a1b11ae1')):
+            return RegistrySourceFormat.XLS
         if stripped.startswith(b'PK\x03\x04'):
             return RegistrySourceFormat.XLSX
         if stripped.startswith(b'%PDF-'):
@@ -62,4 +69,8 @@ class RegistryParser:
         if stripped.startswith(b'<?xml') or stripped.startswith(b'<'):
             return RegistrySourceFormat.XML
 
-        raise RegistryParserError('Не удалось определить формат: ожидается PDF или XML')
+        raise RegistryParserError('Не удалось определить формат: ожидается PDF, XML, XLSX или XLS')
+
+
+def parse_registry(source: str | Path | bytes, *, allow_pdf_fallback: bool = True) -> RegistryDocument:
+    return RegistryParser(allow_pdf_fallback=allow_pdf_fallback).parse(source)

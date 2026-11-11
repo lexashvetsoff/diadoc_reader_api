@@ -7,7 +7,9 @@ from app.services.registry_parser.models import RegistryDocument, RegistryProduc
 class XLSXRegistryParser:
     """A column-labelled certificate registry, independent of absolute row numbers."""
     def parse(self, source):
-        sheets=read_sheets(source)
+        return self.parse_sheets(read_sheets(source), source_format='xlsx')
+
+    def parse_sheets(self, sheets, *, source_format='xlsx'):
         for rows in sheets:
             for ix,(rowno,cols) in enumerate(rows):
                 headings={col:re.sub(r'\s+',' ',val).casefold() for col,val in cols.items()}
@@ -30,11 +32,15 @@ class XLSXRegistryParser:
                         expiration_date=c.get(expiry) or None))
                 if products:
                     text=' '.join(' '.join(c.values()) for _,c in rows[:ix])
-                    m=re.search(r'(?:сч[её]ту-фактуре|сопроводительный документ)\s*№\s*([^\s]+)\s*от\s*(\d{2}\.\d{2}\.\d{4})',text,re.I)
-                    supplier=re.search(r'Поставщик:\s*(.*?)(?=Покупатель:|$)',text,re.I)
-                    buyer=re.search(r'Покупатель:\s*(.*?)(?=Поставщик:|$)',text,re.I)
-                    return RegistryDocument(source_layout='xlsx:column_headers',layout_confidence=1.0,layout_source='xlsx',
+                    m=re.search(r'(?:накладной|сч[её]ту-фактуре|сопроводительный документ)\s*№\s*([^\s]+)\s*от\s*(\d{2}\.\d{2}\.(?:\d{2}|\d{4}))',text,re.I)
+                    supplier=re.search(r'(?:Поставщик|Грузоотправитель):\s*(.*?)(?=Покупатель:|Грузополучатель:|$)',text,re.I)
+                    buyer=re.search(r'(?:Покупатель|Грузополучатель):\s*(.*?)(?=Поставщик:|Грузоотправитель:|$)',text,re.I)
+                    invoice_date=m.group(2) if m else None
+                    if invoice_date and len(invoice_date.rsplit('.', 1)[-1]) == 2:
+                        from datetime import datetime
+                        invoice_date=datetime.strptime(invoice_date, '%d.%m.%y').strftime('%d.%m.%Y')
+                    return RegistryDocument(source_layout=f'{source_format}:column_headers',layout_confidence=1.0,layout_source=source_format,
                         supplier=supplier.group(1).split(',')[0].strip() if supplier else None,
                         buyer=buyer.group(1).split(',')[0].strip() if buyer else None,
-                        invoice_number=m.group(1) if m else None,invoice_date=m.group(2) if m else None,products=products)
-        raise RegistryParserError('В XLSX-реестре не найдена таблица с наименованием, серией и сроком годности')
+                        invoice_number=m.group(1) if m else None,invoice_date=invoice_date,products=products)
+        raise RegistryParserError(f'В {source_format.upper()}-реестре не найдена таблица с наименованием, серией и сроком годности')
